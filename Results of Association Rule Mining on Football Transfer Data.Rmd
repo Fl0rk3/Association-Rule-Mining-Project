@@ -1,0 +1,235 @@
+---
+title: "Results of Association Rule Mining on Football Transfer Data"
+author: "Florian Ficek"
+date: "2026-01-31"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+<div style="text-align: justify">
+Football transfers involve a combination of player attributes, performance indicators, and structural characteristics related to clubs and competitions. Identifying how these features co-occur can provide useful descriptive insights into typical transfer profiles. Association rule mining offers a suitable exploratory framework for this purpose, as it focuses on discovering frequent patterns in categorical data without assuming causal relationships.
+
+This project applies association rule mining to a dataset of football player transfers in order to uncover regularities among player characteristics and transfer-related variables. After appropriate data preprocessing, including discretization and transformation of binary indicators, the Apriori algorithm is used to extract association rules. The discovered rules are evaluated using standard quality measures and visualized to support interpretation of the results.
+</div>
+
+# 1. Dataset
+<div style="text-align: justify">
+The data were scraped from Transfermarkt.com and FBref.com. The dataset includes all player transfers into and out of the Premier League between the 2010 and 2025 seasons. In total, the dataset contains 2025 transfers described by 11 features.
+
+The statistical variables describe player performance metrics recorded in the season preceding the transfer. In cases where a transfer occurred during the winter transfer window, the statistics correspond to the autumn round of the same season.
+</div>
+
+## 1.1. Using Python for Data Cleaning
+<div style="text-align: justify">
+Before executing association rule mining in the R environment, the dataset was preprocessed using Python. Two functions were employed to transform binary variables into categorical factors suitable for association rule analysis.
+
+The first function collapsed groups of mutually exclusive binary columns into a single categorical variable. For example, binary indicators representing player continents (e.g., Europe, Asia, Africa) were merged into one variable named Continent.
+
+The second function transformed individual binary columns into explicit categorical attributes by assigning the column name when the value equaled 1 and prefixing the label with “not_” when the value equaled 0.
+</div>
+
+```{python, eval=FALSE}
+def collapse_binary_columns(
+    df: pd.DataFrame,
+    mapping: dict,
+    new_col: str,
+    default_value: str | None = None
+):
+    def get_value(row):
+        active = [
+            label
+            for col, label in mapping.items()
+            if col in row.index and row[col] == 1
+        ]
+
+        if len(active) == 1:
+            return active[0]
+        elif len(active) == 0:
+            return default_value
+        else:
+            return "Multiple"
+
+    df[new_col] = df.apply(get_value, axis=1)
+
+    drop_cols = [c for c in mapping.keys() if c in df.columns]
+    df.drop(columns=drop_cols, inplace=True)
+
+    return df
+```
+
+```{python, eval=FALSE}
+def binary_to_explicit_category(df, columns):
+    for col in columns:
+        if col not in df.columns:
+            continue
+
+        df[col] = df[col].map({
+            1: col,
+            0: f"not_{col}"
+        })
+
+    return df
+```
+
+<div style="text-align: justify">
+For continuous variables, quantile-based discretization was applied using custom Python functions. The number of quantiles was selected individually for each variable based on its empirical distribution, as assessed using distribution plots. This approach ensures balanced category sizes while preserving meaningful variation in the data.
+</div>
+
+```{python, eval=FALSE}
+def quantile_age_bins(series, q, prefix):
+    bins = pd.qcut(series, q=q, duplicates="drop")
+    return bins.apply(
+        lambda x: f"{prefix}_{int(x.left)}_{int(x.right)}"
+    )
+
+```
+
+## 1.2. Description of Features
+<div style="text-align: justify">
+Whole dataset is descripted by 11 features:
+
+* **Age** - discretized into five intervals: 16–21, 21–23, 23–25, 25–28, and 28–36,
+* **Heights** - discretized into four intervals: 159–178, 178–183, 183–188, and 188–206,
+* **matches** - discretized into four intervals: 0–20, 20–30, 30–37, and 37–56,
+* **goals** - discretized into three intervals: 0–1, 1–5, and 5–36,
+* **y_card** - discretized into three intervals: 0–2, 2–5, and 5–18,
+* **Homegrown** - binary categorical variable with values Homegrown and not_Homegrown,
+* **Position** - categorical variable with four playing positions: Forward, Midfielder, Defender, and Goalkeeper,
+* **Transfer_year** - categorical variable containing 15 values ranging from 2010 to 2024. Transfers occurring during the winter 2025 window were assigned the value 2024, as the year refers to the start of the season,
+* **Continent** - categorical variable with six values: Europe, Africa, South America, North America, Asia, and Oceania,
+* **european_competitions** - categorical variable indicating prior participation in European competitions, with values no_participation, champions_league, and europa_league,
+* **Foot** - variable indicating the player’s dominant foot: right, left, or both.
+</div>
+
+## 1.3. Envionment Preparation
+
+```{r}
+library(arules)
+library(arulesViz)
+library(ggplot2)
+
+transfer_data <- read.csv('transfers_ar.csv')
+
+summary(transfer_data)
+```
+
+## 1.4. Transformation of Data into a Transaction Dataset
+
+```{r}
+transfer_trans <- as(transfer_data, "transactions")
+
+summary(transfer_trans)
+```
+
+```{r}
+inspect(transfer_trans[1:5])
+```
+
+## 1.5. Item Frequency Analysis
+<div style="text-align: justify">
+Before applying the association rule mining algorithm, it is useful to examine an item frequency plot in order to identify which variables occur most frequently in the dataset.
+</div>
+
+```{r}
+itemFrequencyPlot(transfer_trans, topN = 10, col = "skyblue", xlab = "Characteristics", ylab = "Frequency", main = "Item Frequency Distribution in the Transfer Dataset")
+```
+
+<div style="text-align: justify">
+The item frequency distribution indicates that several characteristics occur in a large proportion of transfer transactions. The most frequent items include Foot=right, Continent=Europe, european_competitions=no_participation, and Homegrown=not_Homegrown, each appearing in more than 60% of observations. These items represent structural features of the dataset rather than discriminative attributes and reflect general characteristics of the Premier League transfer market.
+
+Moderately frequent items, such as goals=0–1 and y_card=0–2, suggest that a substantial share of transferred players recorded relatively low attacking output and disciplinary involvement in the season preceding the transfer. In contrast, positional categories such as Position=Forward and Position=Defender exhibit lower frequencies, indicating greater heterogeneity across playing roles.
+</div>
+
+# 2. Application of the Apriori Algorithm
+
+## 2.1. Applying the Apriori Algorithm
+<div style="text-align: justify">
+After transforming the dataset into a transaction format, the Apriori algorithm was applied to discover frequent association rules among player and transfer characteristics. In order to ensure that the extracted rules were both statistically meaningful and interpretable, minimum thresholds for support and confidence were specified. A minimum support value of 0.1 was selected to exclude infrequent patterns and reduce the risk of identifying spurious associations, while a minimum confidence threshold of 0.6 was used to retain rules with a sufficient level of reliability. Additionally, a minimum rule length of two items was imposed to avoid trivial rules consisting of single-item antecedents or consequences.
+</div>
+
+```{r}
+set.seed(123)
+rules1 <- apriori(transfer_trans, parameter = list(support = 0.1, confidence = 0.6, minlen = 2))
+```
+
+```{r}
+rules1
+```
+<div style="text-align: justify">
+The algorithm identified 416 association rules that satisfied the specified criteria.
+</div>
+
+## 2.2. Analysis of Apriori Algorithm Results
+
+```{r}
+rules.by.conf<-sort(rules1, by="confidence", decreasing=TRUE)
+inspect(head(rules.by.conf))
+```
+
+<div style="text-align: justify">
+The rules with the highest confidence predominantly identify associations leading to the outcome Continent = Europe. In particular, players who are homegrown, recorded low goal counts (0–1 goals), and did not participate in European competitions exhibit a very high probability of being European. Confidence values exceeding 0.88 indicate that these antecedent conditions are strongly associated with the European continent category within the dataset.
+
+However, the corresponding lift values, which range from approximately 1.26 to 1.31, suggest that these associations are only moderately stronger than the baseline probability of a player being European. This reflects the structural composition of the Premier League transfer market, where European players constitute the majority, especially among homegrown transfers. Consequently, these rules should be interpreted as descriptive demographic patterns rather than as unexpected or causal relationships.
+
+Overall, the confidence-ranked rules highlight dominant structural characteristics of the dataset and provide insight into how eligibility and performance-related attributes co-occur with player origin. While highly reliable, these rules primarily capture background regularities and therefore complement, rather than replace, the more discriminative patterns identified through lift-based rule analysis.
+</div>
+
+```{r}
+inspect(sort(rules1, by = "lift", decreasing = TRUE)[1:5])
+```
+
+<div style="text-align: justify">
+The rules ranked highest by lift reveal more distinctive and informative associations than those ranked solely by confidence. In contrast to the confidence-based rules, the consequents in this set are not dominated by a single frequent category, but instead relate primarily to low match participation (matches = 0–20) and, in one case, playing position.
+
+The strongest lift values, exceeding 2.5, indicate that players who recorded low goal counts (0–1 goals), few yellow cards (0–2), and no participation in European competitions are more than twice as likely as average to have played 20 or fewer matches in the season preceding the transfer. This pattern consistently appears across multiple rules with slight variations in the antecedent, such as the inclusion of continent or dominant foot, suggesting a robust association between low on-field involvement and limited playing time.
+
+Additionally, the fifth rule indicates that players with high goal output (5–36 goals), no European competition participation, and a right dominant foot are more likely to occupy the forward position. With a lift value above 2.2 and a confidence close to 0.8, this rule highlights a more role-specific pattern, linking performance characteristics to positional classification rather than general demographic attributes.
+
+Overall, the lift-ranked rules capture meaningful structural relationships within the dataset, particularly those related to player involvement intensity and positional roles. Compared to the confidence-ranked rules, these associations are less influenced by highly prevalent background characteristics and therefore provide more informative insights into typical transfer profiles. Consequently, lift-based evaluation proves essential for identifying non-trivial and substantively relevant patterns in the football transfer market.
+</div>
+
+## 2.3. Visualization of Association Rule Results
+<div style="text-align: justify">
+Visualization techniques are essential for interpreting the results of association rule mining, particularly when a large number of rules are generated. Graphical representations allow for an effective exploration of rule quality measures and facilitate the identification of structural patterns that may not be immediately evident from tabular summaries alone. In this chapter, two complementary visualization approaches are employed to examine the discovered association rules.
+</div>
+
+```{r}
+plot(rules1, engine = "ggplot2", main = "Support–Confidence Scatter Plot of Discovered Association Rules")+
+  theme_minimal()+
+  geom_point(size=3)+
+  scale_color_gradient(low = "green", high = "red")
+```
+
+<div style="text-align: justify">
+Figure X presents a scatter plot of the discovered association rules, with support plotted on the horizontal axis and confidence on the vertical axis. Each point represents a single association rule, while color intensity corresponds to the lift value, indicating the strength of the association relative to the baseline frequency of the consequent.
+
+The plot reveals a dense concentration of rules at lower support levels, primarily between 0.1 and 0.2, combined with moderate to high confidence values ranging from approximately 0.6 to 0.8. This distribution reflects the exploratory nature of the analysis, where infrequent but reliable patterns are retained by design. Rules exhibiting higher lift values appear less frequently and are scattered across the mid-support range, suggesting that stronger associations tend to involve more specific combinations of characteristics rather than dominant background features.
+
+Overall, the visualization highlights the trade-off between rule frequency and reliability and reinforces the importance of considering multiple quality measures simultaneously when evaluating association rules. The scatter plot thus serves as an effective diagnostic tool for identifying potentially informative rules for further interpretation.
+</div>
+
+```{r}
+plot(rules1, method="paracoord", control=list(reorder=TRUE), main = "Parallel Coordinates Visualization of Discovered Association Rules")
+```
+
+<div style="text-align: justify">
+The parallel coordinates plot provides a detailed view of the internal structure of the discovered association rules by visualizing the relationships between antecedent components and their corresponding consequents. Each line in the plot represents a single association rule, with the vertical axes corresponding to individual items appearing in the left-hand side of the rules and the final axis indicating the consequent.
+</div>
+
+# Summary
+<div style="text-align: justify">
+This study applied association rule mining to a dataset of Premier League football transfers from the 2010–2025 seasons in order to identify frequent patterns among player characteristics and transfer-related attributes. The analysis was conducted using an exploratory, descriptive approach without making causal claims.
+
+Prior to applying the Apriori algorithm, the data were extensively preprocessed using Python. Continuous variables were discretized, binary indicators were transformed into categorical attributes, and the dataset was converted into transaction format in R. The final dataset consisted of 2,025 transfers described by 11 categorical features.
+
+Using predefined support and confidence thresholds, the Apriori algorithm identified 416 association rules. Evaluation based on support, confidence, and lift revealed that confidence-ranked rules largely reflected dominant structural characteristics of the dataset, whereas lift-ranked rules provided more informative insights related to player involvement and positional roles. Visualization techniques supported the interpretation of these patterns by illustrating the distribution and structure of the discovered rules.
+
+Overall, the results demonstrate that association rule mining can serve as a useful exploratory tool for analyzing football transfer data, provided that appropriate preprocessing and careful interpretation of rule quality measures are applied.
+</div>
